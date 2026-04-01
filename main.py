@@ -4,8 +4,10 @@ Bot de surveillance 24/7 des créneaux disponibles sur RdvPermis.
 """
 
 import asyncio
+import json
 import os
 import random
+import signal
 import time
 
 from playwright.async_api import (
@@ -26,6 +28,32 @@ except ImportError:
 
 import config
 from config import logger
+
+# ---------------------------------------------------------------------------
+# Déduplication persistante
+# ---------------------------------------------------------------------------
+
+def load_notified() -> set[str]:
+    """Charge les créneaux déjà notifiés depuis le fichier de persistance."""
+    if not os.path.exists(config.DEDUP_FILE):
+        return set()
+    try:
+        with open(config.DEDUP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("slots", []))
+    except Exception as exc:
+        logger.warning("Impossible de lire %s : %s", config.DEDUP_FILE, exc)
+        return set()
+
+
+def save_notified(notified: set[str]) -> None:
+    """Sauvegarde le set de déduplication sur disque."""
+    try:
+        with open(config.DEDUP_FILE, "w", encoding="utf-8") as f:
+            json.dump({"slots": list(notified)}, f)
+    except Exception as exc:
+        logger.warning("Impossible de sauvegarder %s : %s", config.DEDUP_FILE, exc)
+
 
 # ---------------------------------------------------------------------------
 # Telegram
@@ -51,9 +79,10 @@ async def send_telegram(bot: Bot, text: str, url: str | None = None) -> None:
 
 # ---------------------------------------------------------------------------
 # Ressources bloquées (optimisation vitesse)
+# Stylesheet retiré : peut casser le rendu des SPA et les sélecteurs dynamiques
 # ---------------------------------------------------------------------------
 
-BLOCKED_TYPES = {"image", "media", "font", "stylesheet"}
+BLOCKED_TYPES = {"image", "media", "font"}
 
 
 async def block_resources(route, request):
@@ -84,7 +113,6 @@ async def create_context(playwright: Playwright) -> tuple[Browser, BrowserContex
 
     browser = await playwright.chromium.launch(**launch_opts)
 
-    # Réutiliser la session si disponible
     if os.path.exists(config.SESSION_FILE):
         context_opts["storage_state"] = config.SESSION_FILE
 
@@ -105,10 +133,9 @@ async def login(page: Page) -> bool:
         await page.goto(config.SEARCH_URL, timeout=config.SELECTOR_TIMEOUT)
         await _mouse_wiggle(page)
 
-        # Vérifier si une page de login est présente
         login_el = await page.query_selector(config.SELECTORS["login_indicator"])
         if not login_el:
-            logger.info("Session déjà active, pas besoin de se reconnecter.")
+            logger.info("Session deja active.")
             return True
 
         await page.fill(config.SELECTORS["login_email"], config.EMAIL)
@@ -123,7 +150,6 @@ async def login(page: Page) -> bool:
             timeout=config.SELECTOR_TIMEOUT,
         )
 
-        # Sauvegarder la session
         await page.context.storage_state(path=config.SESSION_FILE)
         logger.info("Connexion reussie. Session sauvegardee.")
         return True
@@ -158,71 +184,85 @@ async def scrape_slots(page: Page) -> list[dict]:
     lit la grille et retourne la liste des créneaux trouvés.
     Chaque créneau est un dict {date, heure, centre}.
     """
-    try:
-        await page.goto(config.SEARCH_URL, timeout=config.SELECTOR_TIMEOUT)
+    await page.goto(config.SEARCH_URL, timeout=config.SELECTOR_TIMEOUT)
+    await _mouse_wiggle(page)
+
+    if config.SEARCH_CITY:
+        city_el = await page.query_selector(config.SELECTORS["search_city"])
+        if city_el:
+            await city_el.fill(config.SEARCH_CITY)
+            await asyncio.sleep(random.uniform(0.2, 0.5))
+
+    if config.SEARCH_DEPARTMENT:
+        dept_el = await page.query_selector(config.SELECTORS["search_department"])
+        if dept_el:
+            await dept_el.fill(config.SEARCH_DEPARTMENT)
+            await asyncio.sleep(random.uniform(0.2, 0.5))
+
+    submit_el = await page.query_selector(config.SELECTORS["search_submit"])
+    if submit_el:
         await _mouse_wiggle(page)
+        await submit_el.click()
 
-        # Remplir ville / département si des sélecteurs correspondent
-        if config.SEARCH_CITY:
-            city_el = await page.query_selector(config.SELECTORS["search_city"])
-            if city_el:
-                await city_el.fill(config.SEARCH_CITY)
-                await asyncio.sleep(random.uniform(0.2, 0.5))
+    container = await page.wait_for_selector(
+        config.SELECTORS["slots_container"],
+        timeout=config.SELECTOR_TIMEOUT,
+    )
+    if not container:
+        return []
 
-        if config.SEARCH_DEPARTMENT:
-            dept_el = await page.query_selector(config.SELECTORS["search_department"])
-            if dept_el:
-                await dept_el.fill(config.SEARCH_DEPARTMENT)
-                await asyncio.sleep(random.uniform(0.2, 0.5))
+    container_text = await container.inner_text()
 
-        # Soumettre la recherche
-        submit_el = await page.query_selector(config.SELECTORS["search_submit"])
-        if submit_el:
-            await _mouse_wiggle(page)
-            await submit_el.click()
+    if config.SELECTORS["no_slot_text"].lower() in container_text.lower():
+        logger.debug("Aucun creneau disponible.")
+        return []
 
-        # Attendre le conteneur de résultats
-        container = await page.wait_for_selector(
-            config.SELECTORS["slots_container"],
-            timeout=config.SELECTOR_TIMEOUT,
-        )
-        if not container:
-            return []
+    slots: list[dict] = []
+    rows = await container.query_selector_all(
+        "tr, [class*='slot'], [class*='creneau']"
+    )
 
-        container_text = await container.inner_text()
+    for row in rows:
+        text = (await row.inner_text()).strip()
+        if not text or config.SELECTORS["no_slot_text"].lower() in text.lower():
+            continue
 
-        if config.SELECTORS["no_slot_text"].lower() in container_text.lower():
-            logger.debug("Aucun creneau disponible.")
-            return []
+        date_el = await row.query_selector(config.SELECTORS["slot_date"])
+        time_el = await row.query_selector(config.SELECTORS["slot_time"])
+        center_el = await row.query_selector(config.SELECTORS["slot_center"])
 
-        # Parser les créneaux disponibles
-        slots: list[dict] = []
-        rows = await container.query_selector_all("tr, [class*='slot'], [class*='creneau']")
+        date = (await date_el.inner_text()).strip() if date_el else "?"
+        heure = (await time_el.inner_text()).strip() if time_el else "?"
+        centre = (await center_el.inner_text()).strip() if center_el else text[:60]
 
-        for row in rows:
-            text = (await row.inner_text()).strip()
-            if not text or config.SELECTORS["no_slot_text"].lower() in text.lower():
-                continue
+        if date and heure and centre:
+            slots.append({"date": date, "heure": heure, "centre": centre})
 
-            date_el = await row.query_selector(config.SELECTORS["slot_date"])
-            time_el = await row.query_selector(config.SELECTORS["slot_time"])
-            center_el = await row.query_selector(config.SELECTORS["slot_center"])
+    return slots
 
-            date = (await date_el.inner_text()).strip() if date_el else "?"
-            heure = (await time_el.inner_text()).strip() if time_el else "?"
-            centre = (await center_el.inner_text()).strip() if center_el else text[:60]
 
-            if date and heure and centre:
-                slots.append({"date": date, "heure": heure, "centre": centre})
+# ---------------------------------------------------------------------------
+# Réinitialisation du navigateur
+# ---------------------------------------------------------------------------
 
-        return slots
+async def restart_browser(
+    pw: Playwright,
+    browser: Browser,
+) -> tuple[Browser, BrowserContext, Page, bool]:
+    """Ferme le navigateur existant et en crée un nouveau. Retourne (browser, context, page, connected)."""
+    try:
+        await browser.close()
+    except Exception:
+        pass
 
-    except PlaywrightTimeout:
-        logger.warning("Timeout lors du scraping.")
-        raise
-    except Exception as exc:
-        logger.error("Erreur scraping : %s", exc)
-        raise
+    new_browser, new_context = await create_context(pw)
+    new_page = await new_context.new_page()
+
+    if STEALTH_AVAILABLE:
+        await stealth_async(new_page)
+
+    connected = await login(new_page)
+    return new_browser, new_context, new_page, connected
 
 
 # ---------------------------------------------------------------------------
@@ -230,18 +270,36 @@ async def scrape_slots(page: Page) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 async def run() -> None:
+    config.validate()
+
     bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
+
+    # Vérification de la connexion Telegram au démarrage
+    try:
+        await bot.get_me()
+    except Exception as exc:
+        logger.error("Impossible de joindre Telegram : %s", exc)
+        raise SystemExit(1) from exc
+
+    notified: set[str] = load_notified()
+    consecutive_errors = 0
+    last_browser_restart = time.monotonic()
+    last_dedup_reset = time.monotonic()
+    shutdown = False
+
+    def _handle_signal(sig, frame):
+        nonlocal shutdown
+        logger.info("Signal %s recu, arret en cours...", sig)
+        shutdown = True
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
 
     await send_telegram(
         bot,
         "Bot Alertes Permis demarre.\n"
         f"Surveillance de : <b>{config.SEARCH_CITY or config.SEARCH_DEPARTMENT}</b>",
     )
-
-    notified: set[str] = set()
-    consecutive_errors = 0
-    last_browser_restart = time.monotonic()
-    last_dedup_reset = time.monotonic()
 
     async with async_playwright() as pw:
         browser, context = await create_context(pw)
@@ -253,100 +311,107 @@ async def run() -> None:
         connected = await login(page)
         if not connected:
             logger.error("Impossible de se connecter. Arret.")
+            await send_telegram(bot, "Echec de connexion au demarrage. Bot arrete.")
             await browser.close()
             return
 
-        while True:
-            now = time.monotonic()
+        try:
+            while not shutdown:
+                now = time.monotonic()
 
-            # Vidage périodique de la déduplication (6h)
-            if now - last_dedup_reset > config.DEDUP_RESET_INTERVAL:
-                notified.clear()
-                last_dedup_reset = now
-                logger.info("Set de deduplication reinitialise.")
+                # Vidage périodique de la déduplication (défaut 6h)
+                if now - last_dedup_reset > config.DEDUP_RESET_INTERVAL:
+                    notified.clear()
+                    save_notified(notified)
+                    last_dedup_reset = now
+                    logger.info("Set de deduplication reinitialise.")
 
-            # Redémarrage périodique du navigateur (2h)
-            if now - last_browser_restart > config.BROWSER_RESTART_INTERVAL:
-                logger.info("Redemarrage du navigateur (maintenance 2h).")
-                await browser.close()
-                browser, context = await create_context(pw)
-                page = await context.new_page()
-                if STEALTH_AVAILABLE:
-                    await stealth_async(page)
-                await login(page)
-                last_browser_restart = time.monotonic()
-
-            try:
-                slots = await scrape_slots(page)
-                consecutive_errors = 0
-
-                for slot in slots:
-                    key = f"{slot['date']}_{slot['heure']}_{slot['centre']}"
-                    if key in notified:
-                        continue
-
-                    notified.add(key)
-                    msg = (
-                        "CRENEAU DISPONIBLE !\n\n"
-                        f"Date : <b>{slot['date']}</b>\n"
-                        f"Heure : <b>{slot['heure']}</b>\n"
-                        f"Centre : <b>{slot['centre']}</b>"
-                    )
-                    logger.info("Creneau trouve : %s", key)
-                    await send_telegram(bot, msg, url=config.RESERVATION_URL)
-
-            except PlaywrightTimeout:
-                consecutive_errors += 1
-                logger.warning("Timeout (#%d).", consecutive_errors)
-
-                # Vérifier si session expirée → reconnexion
-                try:
-                    login_el = await page.query_selector(
-                        config.SELECTORS["login_indicator"]
-                    )
-                    if login_el:
-                        logger.info("Session expiree, reconnexion...")
-                        await login(page)
-                except Exception:
-                    pass
-
-            except Exception as exc:
-                consecutive_errors += 1
-                logger.error("Erreur inattendue (#%d) : %s", consecutive_errors, exc)
-
-                # Recréer le contexte en cas d'erreur grave
-                try:
-                    await context.close()
-                except Exception:
-                    pass
-                try:
-                    _, context = await create_context(pw)
-                    page = await context.new_page()
-                    if STEALTH_AVAILABLE:
-                        await stealth_async(page)
-                    await login(page)
+                # Redémarrage périodique du navigateur (défaut 2h)
+                if now - last_browser_restart > config.BROWSER_RESTART_INTERVAL:
+                    logger.info("Redemarrage du navigateur (maintenance).")
+                    browser, context, page, connected = await restart_browser(pw, browser)
                     last_browser_restart = time.monotonic()
-                except Exception as reinit_exc:
-                    logger.error("Echec reinitialisation : %s", reinit_exc)
+                    if not connected:
+                        logger.warning("Reconnexion echouee apres restart navigateur.")
 
-            # Pause longue si trop d'erreurs consécutives
-            if consecutive_errors >= 5:
-                logger.warning(
-                    "%d erreurs consecutives. Pause de %ds.",
-                    consecutive_errors,
-                    config.LONG_PAUSE,
-                )
-                await send_telegram(
-                    bot,
-                    f"Attention : {consecutive_errors} erreurs consecutives. "
-                    f"Pause de {config.LONG_PAUSE // 60} min.",
-                )
-                await asyncio.sleep(config.LONG_PAUSE)
-                consecutive_errors = 0
-            else:
-                delay = random.uniform(config.MIN_DELAY, config.MAX_DELAY)
-                logger.debug("Prochain cycle dans %.0fs.", delay)
-                await asyncio.sleep(delay)
+                try:
+                    slots = await scrape_slots(page)
+                    consecutive_errors = 0
+
+                    for slot in slots:
+                        key = f"{slot['date']}_{slot['heure']}_{slot['centre']}"
+                        if key in notified:
+                            continue
+
+                        notified.add(key)
+                        save_notified(notified)
+
+                        msg = (
+                            "CRENEAU DISPONIBLE !\n\n"
+                            f"Date : <b>{slot['date']}</b>\n"
+                            f"Heure : <b>{slot['heure']}</b>\n"
+                            f"Centre : <b>{slot['centre']}</b>"
+                        )
+                        logger.info("Creneau trouve : %s", key)
+                        await send_telegram(bot, msg, url=config.RESERVATION_URL)
+
+                except PlaywrightTimeout:
+                    consecutive_errors += 1
+                    logger.warning("Timeout (#%d).", consecutive_errors)
+
+                    # Vérifier si session expirée → reconnexion
+                    try:
+                        login_el = await page.query_selector(
+                            config.SELECTORS["login_indicator"]
+                        )
+                        if login_el:
+                            logger.info("Session expiree, reconnexion...")
+                            await login(page)
+                    except Exception:
+                        pass
+
+                except Exception as exc:
+                    consecutive_errors += 1
+                    logger.error("Erreur inattendue (#%d) : %s", consecutive_errors, exc)
+
+                    # Recréer le contexte navigateur complet
+                    browser, context, page, connected = await restart_browser(pw, browser)
+                    last_browser_restart = time.monotonic()
+                    if connected:
+                        consecutive_errors = 0  # recovery réussi
+                    else:
+                        logger.warning("Reconnexion echouee apres erreur.")
+
+                if shutdown:
+                    break
+
+                # Pause longue si trop d'erreurs consécutives
+                if consecutive_errors >= 5:
+                    logger.warning(
+                        "%d erreurs consecutives. Pause de %ds.",
+                        consecutive_errors,
+                        config.LONG_PAUSE,
+                    )
+                    await send_telegram(
+                        bot,
+                        f"Attention : {consecutive_errors} erreurs consecutives. "
+                        f"Pause de {config.LONG_PAUSE // 60} min.",
+                    )
+                    await asyncio.sleep(config.LONG_PAUSE)
+                    consecutive_errors = 0
+                else:
+                    delay = random.uniform(config.MIN_DELAY, config.MAX_DELAY)
+                    logger.debug("Prochain cycle dans %.0fs.", delay)
+                    await asyncio.sleep(delay)
+
+        finally:
+            logger.info("Arret du bot.")
+            save_notified(notified)
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            await send_telegram(bot, "Bot Alertes Permis arrete.")
 
 
 if __name__ == "__main__":

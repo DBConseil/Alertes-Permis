@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import sys
 from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
@@ -33,13 +34,13 @@ MAX_DELAY = float(os.getenv("MAX_DELAY", "90"))
 SELECTOR_TIMEOUT = int(os.getenv("SELECTOR_TIMEOUT", "15000"))
 
 # Pause longue après 5 erreurs consécutives (secondes)
-LONG_PAUSE = 300
+LONG_PAUSE = int(os.getenv("LONG_PAUSE", "300"))
 
-# Redémarrage navigateur toutes les X secondes (2h)
-BROWSER_RESTART_INTERVAL = 7200
+# Redémarrage navigateur toutes les X secondes (défaut : 2h)
+BROWSER_RESTART_INTERVAL = int(os.getenv("BROWSER_RESTART_INTERVAL", "7200"))
 
-# Vidage du set de déduplication toutes les X secondes (6h)
-DEDUP_RESET_INTERVAL = 21600
+# Vidage du set de déduplication toutes les X secondes (défaut : 6h)
+DEDUP_RESET_INTERVAL = int(os.getenv("DEDUP_RESET_INTERVAL", "21600"))
 
 # ---------------------------------------------------------------------------
 # Proxy
@@ -110,6 +111,9 @@ VIEWPORTS = [
 # Fichier de sauvegarde de session Playwright
 SESSION_FILE = "storage_state.json"
 
+# Fichier de persistance de la déduplication
+DEDUP_FILE = "notified_slots.json"
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -127,6 +131,32 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("alertes_permis")
+
+
+# ---------------------------------------------------------------------------
+# Validation au démarrage
+# ---------------------------------------------------------------------------
+
+def validate() -> None:
+    """Vérifie que toutes les variables critiques sont définies. Quitte si non."""
+    errors = []
+    if not EMAIL:
+        errors.append("EMAIL manquant dans .env")
+    if not PASSWORD:
+        errors.append("PASSWORD manquant dans .env")
+    if not TELEGRAM_BOT_TOKEN:
+        errors.append("TELEGRAM_BOT_TOKEN manquant dans .env")
+    if not TELEGRAM_CHAT_ID:
+        errors.append("TELEGRAM_CHAT_ID manquant dans .env")
+    if not SEARCH_CITY and not SEARCH_DEPARTMENT:
+        errors.append("SEARCH_CITY ou SEARCH_DEPARTMENT doit être défini dans .env")
+    if MIN_DELAY >= MAX_DELAY:
+        errors.append(f"MIN_DELAY ({MIN_DELAY}) doit être < MAX_DELAY ({MAX_DELAY})")
+
+    if errors:
+        for err in errors:
+            logger.error("Configuration invalide : %s", err)
+        sys.exit(1)
 
 
 def random_user_agent() -> str:
