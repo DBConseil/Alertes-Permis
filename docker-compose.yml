@@ -1,0 +1,14 @@
+services:
+  alertes-permis:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - SESSION_FILE=/app/data/storage_state.json
+      - DEDUP_FILE=/app/data/notified_slots.json
+      - LOG_FILE=/app/data/alertes_permis.log
+    # Nécessaire pour Playwright/Chromium headless en container
+    shm_size: "256m"

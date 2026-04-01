@@ -1,0 +1,22 @@
+[Unit]
+Description=Alertes Permis de Conduire - Bot de surveillance RdvPermis
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=alertes
+WorkingDirectory=/opt/alertes-permis
+EnvironmentFile=/opt/alertes-permis/.env
+ExecStart=/opt/alertes-permis/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Redémarrage automatique si le processus consomme trop de mémoire (512 MB)
+MemoryMax=512M
+MemorySwapMax=0
+
+[Install]
+WantedBy=multi-user.target

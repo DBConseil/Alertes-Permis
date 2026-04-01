@@ -283,8 +283,10 @@ async def run() -> None:
 
     notified: set[str] = load_notified()
     consecutive_errors = 0
+    cycle_count = 0
     last_browser_restart = time.monotonic()
     last_dedup_reset = time.monotonic()
+    last_heartbeat = time.monotonic()
     shutdown = False
 
     def _handle_signal(sig, frame):
@@ -334,9 +336,20 @@ async def run() -> None:
                     if not connected:
                         logger.warning("Reconnexion echouee apres restart navigateur.")
 
+                # Heartbeat Telegram (défaut 1h)
+                if now - last_heartbeat > config.HEARTBEAT_INTERVAL:
+                    await send_telegram(
+                        bot,
+                        f"Heartbeat : bot actif.\n"
+                        f"Cycles effectues : <b>{cycle_count}</b>\n"
+                        f"Zone surveillee : <b>{config.SEARCH_CITY or config.SEARCH_DEPARTMENT}</b>",
+                    )
+                    last_heartbeat = now
+
                 try:
                     slots = await scrape_slots(page)
                     consecutive_errors = 0
+                    cycle_count += 1
 
                     for slot in slots:
                         key = f"{slot['date']}_{slot['heure']}_{slot['centre']}"

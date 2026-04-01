@@ -42,6 +42,9 @@ BROWSER_RESTART_INTERVAL = int(os.getenv("BROWSER_RESTART_INTERVAL", "7200"))
 # Vidage du set de déduplication toutes les X secondes (défaut : 6h)
 DEDUP_RESET_INTERVAL = int(os.getenv("DEDUP_RESET_INTERVAL", "21600"))
 
+# Heartbeat Telegram toutes les X secondes (défaut : 1h)
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "3600"))
+
 # ---------------------------------------------------------------------------
 # Proxy
 # ---------------------------------------------------------------------------
@@ -109,18 +112,19 @@ VIEWPORTS = [
 ]
 
 # Fichier de sauvegarde de session Playwright
-SESSION_FILE = "storage_state.json"
+SESSION_FILE = os.getenv("SESSION_FILE", "storage_state.json")
 
 # Fichier de persistance de la déduplication
-DEDUP_FILE = "notified_slots.json"
+DEDUP_FILE = os.getenv("DEDUP_FILE", "notified_slots.json")
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+_log_file = os.getenv("LOG_FILE", "alertes_permis.log")
 _handler_file = RotatingFileHandler(
-    "alertes_permis.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    _log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
 )
 _handler_console = logging.StreamHandler()
 
